@@ -21,3 +21,9 @@
 *.jks
 *.p12
 *.mobileprovision
+
+# Local runtime state and secrets
+server/.data/
+*.db
+*.db-wal
+*.db-shm
