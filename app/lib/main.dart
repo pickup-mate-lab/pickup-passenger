@@ -4,6 +4,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
@@ -12,6 +13,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'arrival.dart';
 import 'phone_auth.dart';
 
 Future<void> main() async {
@@ -130,12 +132,14 @@ class _PassengerHomeState extends State<PassengerHome>
   final TextEditingController message = TextEditingController();
   final MapController map = MapController();
   Map<String, dynamic>? state;
-  Map<String, dynamic>? walking;
   List<dynamic> inbox = [];
   LatLng selected = const LatLng(37.4979, 127.0276);
   bool selectedByUser = false;
   bool busy = false;
   bool sharing = false;
+  bool resumeSharing = false;
+  int alertedStage = 0;
+  Object? alertedRevision;
   bool foreground = true;
   bool locationBusy = false;
   bool inboxBusy = false;
@@ -187,13 +191,29 @@ class _PassengerHomeState extends State<PassengerHome>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
-    foreground = lifecycle == AppLifecycleState.resumed;
-    if (lifecycle != AppLifecycleState.resumed && sharing) {
-      sharing = false;
-      api
-          .update('location-consent', {'enabled': false})
-          .catchError((_) => <String, dynamic>{});
-      if (mounted) setState(() {});
+    // `inactive` also fires for permission dialogs and the notification shade
+    // while the app is still on screen, so only a real background stops sharing.
+    final background =
+        lifecycle == AppLifecycleState.paused ||
+        lifecycle == AppLifecycleState.hidden ||
+        lifecycle == AppLifecycleState.detached;
+    if (background) {
+      foreground = false;
+      if (sharing) {
+        sharing = false;
+        resumeSharing = true;
+        api
+            .update('location-consent', {'enabled': false})
+            .catchError((_) => <String, dynamic>{});
+        if (mounted) setState(() {});
+      }
+    } else if (lifecycle == AppLifecycleState.resumed) {
+      foreground = true;
+      if (resumeSharing) {
+        resumeSharing = false;
+        final status = state?['status'];
+        if (status == 'active' || status == 'pickup_pending') setSharing(true);
+      }
     }
   }
 
@@ -250,7 +270,7 @@ class _PassengerHomeState extends State<PassengerHome>
       sharing = false;
     }
     state = await api.demo();
-    walking = null;
+    resumeSharing = false;
     inbox = [];
     poll?.cancel();
     poll = Timer.periodic(const Duration(seconds: 4), (_) => refresh());
@@ -265,7 +285,7 @@ class _PassengerHomeState extends State<PassengerHome>
     poll?.cancel();
     api.id = null;
     state = null;
-    walking = null;
+    resumeSharing = false;
     final result = await api.inbox();
     inbox = (result['requests'] as List<dynamic>?) ?? [];
     final uid = FirebaseAuth.instance.currentUser?.uid;
@@ -338,7 +358,7 @@ class _PassengerHomeState extends State<PassengerHome>
     api.accountMode = true;
     api.id = request['id'] as String;
     state = await api.state();
-    walking = null;
+    resumeSharing = false;
     inbox = [];
     poll?.cancel();
     poll = Timer.periodic(const Duration(seconds: 4), (_) => refresh());
@@ -360,14 +380,10 @@ class _PassengerHomeState extends State<PassengerHome>
       }
       if (mounted) {
         setState(() {
-          final currentPickup = current['pickup'] as Map<String, dynamic>?;
-          if (walking != null &&
-              currentPickup?['revision'] != walking!['pickupRevision']) {
-            walking = null;
-          }
           state = current;
           error = null;
         });
+        announceStage(current);
       }
       if (sharing &&
           !locationBusy &&
@@ -418,7 +434,6 @@ class _PassengerHomeState extends State<PassengerHome>
       'lon': selected.longitude,
       'label': name,
     });
-    walking = null;
     if (mounted) setState(() {});
   });
 
@@ -445,12 +460,34 @@ class _PassengerHomeState extends State<PassengerHome>
     if (consent != true || !mounted) return;
     await run(() async {
       final p = await position();
-      walking = await api.update('walking-estimate', {
+      await api.update('walking-estimate', {
         'lat': p.latitude,
         'lon': p.longitude,
       });
-      if (mounted) setState(() {});
+      // The server keeps the walking time and recomputes departure as the car moves.
+      state = await api.state();
+      if (mounted) {
+        setState(() {});
+        announceStage(state!);
+      }
     });
+  }
+
+  /// Alerts once per newly reached stage of the current pickup point, so the
+  /// passenger is told even when push notifications are not configured.
+  void announceStage(Map<String, dynamic> current) {
+    final revision = (current['pickup'] as Map<String, dynamic>?)?['revision'];
+    if (revision != alertedRevision) {
+      alertedRevision = revision;
+      alertedStage = 0;
+    }
+    final stage = current['arrivalStage'] as String?;
+    final rank = stageRank(stage);
+    final text = stageAlert(stage);
+    if (rank <= alertedStage || text == null || !mounted) return;
+    alertedStage = rank;
+    HapticFeedback.mediumImpact();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   Future<void> setSharing(bool enabled) => run(() async {
@@ -521,6 +558,11 @@ class _PassengerHomeState extends State<PassengerHome>
     final pickup = state?['pickup'] as Map<String, dynamic>?;
     final driver = state?['driverLocation'] as Map<String, dynamic>?;
     final eta = state?['etaSeconds'] as int?;
+    final departure = departureText(
+      state?['walkingSeconds'] as int?,
+      state?['departureInSeconds'] as int?,
+    );
+    final stageMessage = stageAlert(state?['arrivalStage'] as String?);
     final messages = (state?['messages'] as List<dynamic>?) ?? [];
     final closed = status == 'finished' || status == 'expired';
     return Scaffold(
@@ -699,11 +741,18 @@ class _PassengerHomeState extends State<PassengerHome>
                           ? '위치 공유가 종료되었습니다.'
                           : '대상: ${state!['contactName'] ?? '탑승자'}',
                     ),
-                    if (active)
-                      Text(
-                        eta == null
-                            ? '도착 시간: 아직 제공되지 않음'
-                            : '도착까지 약 ${(eta / 60).ceil().clamp(1, 9999)}분',
+                    if (active) Text(etaText(eta)),
+                    if (active && departure != null) Text(departure),
+                    if (active && stageMessage != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 6),
+                        child: Text(
+                          stageMessage,
+                          style: const TextStyle(
+                            color: mint,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
                       ),
                     if (driver != null)
                       Text('차량 좌표: ${driver['lat']}, ${driver['lon']}'),
@@ -841,7 +890,7 @@ class _PassengerHomeState extends State<PassengerHome>
                         contentPadding: EdgeInsets.zero,
                         title: const Text('내 현재 위치 공유'),
                         subtitle: const Text(
-                          '동의한 경우에만 앱을 보는 동안 공유합니다. 앱을 벗어나면 중지됩니다.',
+                          '동의한 경우에만 앱을 보는 동안 공유합니다. 앱을 벗어나면 중지되고, 돌아오면 다시 공유합니다.',
                         ),
                         value: sharing,
                         onChanged: busy ? null : setSharing,
@@ -853,14 +902,7 @@ class _PassengerHomeState extends State<PassengerHome>
                           icon: const Icon(Icons.directions_walk),
                           label: const Text('승차 지점까지 도보 시간 확인'),
                         ),
-                        if (walking != null)
-                          Text(
-                            '도보 약 ${((walking!['walkingSeconds'] as int) / 60).ceil()}분 · ${walking!['departureInSeconds'] == null
-                                ? '차량 도착 시간 확인 중'
-                                : (walking!['departureInSeconds'] as int) <= 0
-                                ? '지금 출발을 준비해 주세요'
-                                : '약 ${((walking!['departureInSeconds'] as int) / 60).ceil()}분 뒤 출발 준비'} (조회 시점 기준)',
-                          ),
+                        if (departure != null) Text(departure),
                       ],
                       const Divider(),
                       const Text(
