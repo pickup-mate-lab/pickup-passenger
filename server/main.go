@@ -45,7 +45,8 @@ type session struct {
 	ETA                                                              *int
 	Revision                                                         int
 	Messages                                                         []message
-	NotifiedRevision                                                 int
+	WalkingSeconds                                                   *int
+	WalkingRevision, AlertRevision, AlertStage                       int
 }
 type store struct {
 	mu       sync.Mutex
@@ -105,14 +106,18 @@ func (p *session) expire() {
 func (p *session) view(role string) map[string]any {
 	visible := p.Status == "active" || p.Status == "pickup_pending"
 	var driver, passenger *point
-	var eta *int
+	var eta, walking, departure *int
+	stage := stageNone
 	messages := []message{}
 	if visible {
 		if p.DriverLocation != nil {
 			copy := *p.DriverLocation
 			driver = &copy
 		}
-		eta = p.ETA
+		eta = p.freshETA()
+		walking = p.walking()
+		departure = p.departureIn()
+		stage = p.stage()
 		messages = append(messages, p.Messages...)
 		if role == "driver" {
 			if p.PassengerLocation != nil {
@@ -126,11 +131,7 @@ func (p *session) view(role string) map[string]any {
 		copy := *p.Pickup
 		pickup = &copy
 	}
-	if eta != nil {
-		copy := *eta
-		eta = &copy
-	}
-	return map[string]any{"id": p.ID, "contactName": p.ContactName, "pickupTime": p.PickupTime, "status": p.Status, "pickup": pickup, "driverLocation": driver, "passengerLocation": passenger, "passengerLocationSharing": visible && p.Sharing, "etaSeconds": eta, "messages": messages, "expiresAt": p.Expires.UTC().Format(time.RFC3339)}
+	return map[string]any{"id": p.ID, "contactName": p.ContactName, "pickupTime": p.PickupTime, "status": p.Status, "pickup": pickup, "driverLocation": driver, "passengerLocation": passenger, "passengerLocationSharing": visible && p.Sharing, "etaSeconds": eta, "walkingSeconds": walking, "departureInSeconds": departure, "arrivalStage": stageNames[stage], "messages": messages, "expiresAt": p.Expires.UTC().Format(time.RFC3339)}
 }
 func respond(w http.ResponseWriter, code int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -284,6 +285,7 @@ func (s *store) serveLegacy(w http.ResponseWriter, r *http.Request, internal boo
 		p.Pickup = &point{Lat: lat, Lon: lon, Label: label, Revision: p.Revision, UpdatedAt: time.Now().UTC()}
 		p.Status = "pickup_pending"
 		p.ETA = nil
+		p.WalkingSeconds = nil
 	case "confirm":
 		if role != "driver" {
 			fail(w, 403, "Only the driver can confirm")
