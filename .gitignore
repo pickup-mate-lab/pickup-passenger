@@ -1,0 +1,23 @@
+# Flutter and Android generated files
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.packages
+**/build/
+**/android/.gradle/
+**/android/local.properties
+**/ios/Pods/
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+# Editors and local configuration
+.idea/
+.vscode/
+*.iml
+.env
+.env.*
+!.env.example
+*.keystore
+*.jks
+*.p12
+*.mobileprovision
