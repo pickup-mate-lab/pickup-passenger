@@ -220,16 +220,19 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 			fail(w, 409, "Pickup location changed; try again")
 			return
 		}
-		var depart *int
-		if p.ETA != nil && p.DriverLocation != nil && time.Since(p.DriverLocation.UpdatedAt) < 60*time.Second {
-			v := *p.ETA - seconds - 120
-			if v < 0 {
-				v = 0
-			}
-			depart = &v
+		previousSeconds, previousRevision := p.WalkingSeconds, p.WalkingRevision
+		p.WalkingSeconds = &seconds
+		p.WalkingRevision = revision
+		if err := s.persistLocked(); err != nil {
+			p.WalkingSeconds, p.WalkingRevision = previousSeconds, previousRevision
+			s.mu.Unlock()
+			fail(w, 500, "Storage failure")
+			return
 		}
+		depart := p.departureIn()
 		s.mu.Unlock()
 		respond(w, 200, map[string]any{"walkingSeconds": seconds, "departureInSeconds": depart, "pickupRevision": revision, "provider": "TMAP"})
+		s.checkAlerts(parts[3])
 		return
 	}
 	// The legacy engine enforces driver/passenger permissions and never receives
@@ -256,31 +259,7 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if parts[4] == "location" && isDriver {
-		s.mu.Lock()
-		p = s.sessions[parts[3]]
-		notify := false
-		phone := ""
-		if p != nil && p.Status == "active" && p.Pickup != nil && p.ETA != nil && *p.ETA <= 300 && p.NotifiedRevision != p.Revision && s.push != nil {
-			for _, d := range s.devices {
-				if d.Phone == p.PassengerPhone && time.Since(d.UpdatedAt) < 30*24*time.Hour {
-					notify = true
-					break
-				}
-			}
-			if notify {
-				old := p.NotifiedRevision
-				p.NotifiedRevision = p.Revision
-				if err := s.persistLocked(); err != nil {
-					p.NotifiedRevision = old
-					notify = false
-				}
-				phone = p.PassengerPhone
-			}
-		}
-		s.mu.Unlock()
-		if notify {
-			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, "차량이 곧 도착해요. 픽업 위치를 확인해 주세요.")
-		}
+		s.checkAlerts(parts[3])
 	}
 }
 
