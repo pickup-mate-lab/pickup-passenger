@@ -140,16 +140,20 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 		p.DriverUID = who.UID
 		p.PassengerPhone = phone
 		s.latest = previousLatest // Never expose authenticated requests through the demo endpoint.
-		if err := s.persistLocked(); err != nil {
+		jobs := s.makePushJobsLocked(func(d deviceRecord) bool { return d.Phone == phone }, "새 픽업 요청이 도착했어요. 앱에서 확인해 주세요.", p.ID, 0)
+		if err := s.persistLockedWithOutbox(jobs); err != nil {
 			delete(s.sessions, p.ID)
 			s.mu.Unlock()
 			fail(w, 500, "Storage failure")
 			return
 		}
 		view := p.view("driver")
+		durable := s.db != nil
 		s.mu.Unlock()
 		respond(w, 201, view)
-		s.notify(func(d deviceRecord) bool { return d.Phone == phone }, "새 픽업 요청이 도착했어요. 앱에서 확인해 주세요.")
+		if !durable {
+			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, "새 픽업 요청이 도착했어요. 앱에서 확인해 주세요.", p.ID, 0)
+		}
 		return
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -177,6 +181,64 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Unlock()
+	// Store message and notification job in the same transaction so a
+	// server restart cannot leave a delivered message without its alert.
+	if len(parts) == 5 && parts[4] == "message" && r.Method == http.MethodPost {
+		body, err := parse(r)
+		if err != nil {
+			fail(w, 400, err.Error())
+			return
+		}
+		content, ok := text(body["text"], 160)
+		if !ok {
+			fail(w, 400, "Message is required")
+			return
+		}
+		s.mu.Lock()
+		p = s.sessions[parts[3]]
+		if p == nil || (p.DriverUID != who.UID && p.PassengerPhone != who.Phone) {
+			s.mu.Unlock()
+			fail(w, 404, "Not found")
+			return
+		}
+		p.expire()
+		if p.Status != "active" && p.Status != "pickup_pending" {
+			s.mu.Unlock()
+			fail(w, 409, "Accept the pickup first")
+			return
+		}
+		role := "passenger"
+		match := func(d deviceRecord) bool { return d.UID == p.DriverUID }
+		if p.DriverUID == who.UID {
+			role = "driver"
+			match = func(d deviceRecord) bool { return d.Phone == p.PassengerPhone }
+		}
+		previous := append([]message(nil), p.Messages...)
+		p.Messages = append(p.Messages, message{ID: token(9), Sender: role, Text: content, CreatedAt: time.Now().UTC()})
+		if len(p.Messages) > 50 {
+			p.Messages = p.Messages[len(p.Messages)-50:]
+		}
+		jobs := s.makePushJobsLocked(match, "새 메시지가 도착했어요. 앱에서 확인해 주세요.", p.ID, 0)
+		if err := s.persistLockedWithOutbox(jobs); err != nil {
+			p.Messages = previous
+			s.mu.Unlock()
+			fail(w, 500, "Storage failure")
+			return
+		}
+		view := p.view(role)
+		durable := s.db != nil
+		targetPhone, targetUID, pickupID := p.PassengerPhone, p.DriverUID, p.ID
+		s.mu.Unlock()
+		respond(w, 200, view)
+		if !durable {
+			if role == "driver" {
+				s.notify(func(d deviceRecord) bool { return d.Phone == targetPhone }, "새 메시지가 도착했어요. 앱에서 확인해 주세요.", pickupID, 0)
+			} else {
+				s.notify(func(d deviceRecord) bool { return d.UID == targetUID }, "새 메시지가 도착했어요. 앱에서 확인해 주세요.", pickupID, 0)
+			}
+		}
+		return
+	}
 	if len(parts) == 5 && parts[4] == "walking-estimate" && r.Method == http.MethodPost {
 		if isDriver {
 			fail(w, 403, "Only the passenger can request a walking estimate")
@@ -220,6 +282,19 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 			fail(w, 409, "Pickup location changed; try again")
 			return
 		}
+		// Store only the duration, not the passenger's walking origin.
+		oldWalk, oldRevision := p.WalkingSeconds, p.WalkingRevision
+		oldGeneration, oldNotification := p.WalkingGeneration, p.DepartureNotifiedRevision
+		p.WalkingSeconds, p.WalkingRevision = &seconds, revision
+		p.WalkingGeneration++
+		p.DepartureNotifiedRevision = 0
+		if err := s.persistLocked(); err != nil {
+			p.WalkingSeconds, p.WalkingRevision = oldWalk, oldRevision
+			p.WalkingGeneration, p.DepartureNotifiedRevision = oldGeneration, oldNotification
+			s.mu.Unlock()
+			fail(w, 500, "Unable to save walking estimate")
+			return
+		}
 		var depart *int
 		if p.ETA != nil && p.DriverLocation != nil && time.Since(p.DriverLocation.UpdatedAt) < 60*time.Second {
 			v := *p.ETA - seconds - 120
@@ -248,38 +323,46 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 	if status.code < 200 || status.code >= 300 || r.Method != http.MethodPost || len(parts) != 5 {
 		return
 	}
-	if parts[4] == "message" {
-		if isDriver {
-			s.notify(func(d deviceRecord) bool { return d.Phone == p.PassengerPhone }, "새 메시지가 도착했어요. 앱에서 확인해 주세요.")
-		} else {
-			s.notify(func(d deviceRecord) bool { return d.UID == p.DriverUID }, "새 메시지가 도착했어요. 앱에서 확인해 주세요.")
-		}
-	}
 	if parts[4] == "location" && isDriver {
 		s.mu.Lock()
 		p = s.sessions[parts[3]]
-		notify := false
-		phone := ""
-		if p != nil && p.Status == "active" && p.Pickup != nil && p.ETA != nil && *p.ETA <= 300 && p.NotifiedRevision != p.Revision && s.push != nil {
-			for _, d := range s.devices {
-				if d.Phone == p.PassengerPhone && time.Since(d.UpdatedAt) < 30*24*time.Hour {
-					notify = true
-					break
+		var jobs []outboxItem
+		var arrival, departure bool
+		var phone string
+		var revision, oldArrival, oldDeparture int
+		if p != nil && p.Status == "active" && p.Pickup != nil && p.ETA != nil {
+			phone, revision = p.PassengerPhone, p.Revision
+			oldArrival, oldDeparture = p.NotifiedRevision, p.DepartureNotifiedRevision
+			match := func(d deviceRecord) bool { return d.Phone == phone }
+			if *p.ETA <= 300 && p.NotifiedRevision != revision {
+				next := s.makePushJobsLocked(match, arrivalPush, p.ID, revision)
+				if len(next) > 0 {
+					arrival = true
+					p.NotifiedRevision = revision
+					jobs = append(jobs, next...)
 				}
 			}
-			if notify {
-				old := p.NotifiedRevision
-				p.NotifiedRevision = p.Revision
-				if err := s.persistLocked(); err != nil {
-					p.NotifiedRevision = old
-					notify = false
+			if p.WalkingSeconds != nil && p.WalkingRevision == revision && p.DepartureNotifiedRevision != revision && *p.ETA <= *p.WalkingSeconds+120 {
+				next := s.makePushJobsLocked(match, departurePush, p.ID, revision)
+				if len(next) > 0 {
+					departure = true
+					p.DepartureNotifiedRevision = revision
+					jobs = append(jobs, next...)
 				}
-				phone = p.PassengerPhone
+			}
+			if (arrival || departure) && s.persistLockedWithOutbox(jobs) != nil {
+				p.NotifiedRevision, p.DepartureNotifiedRevision = oldArrival, oldDeparture
+				arrival, departure = false, false
 			}
 		}
+		durable := s.db != nil
 		s.mu.Unlock()
-		if notify {
-			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, "차량이 곧 도착해요. 픽업 위치를 확인해 주세요.")
+		// In-memory demo/test stores have no worker or persistent queue.
+		if !durable && arrival {
+			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, arrivalPush, parts[3], revision)
+		}
+		if !durable && departure {
+			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, departurePush, parts[3], revision)
 		}
 	}
 }

@@ -14,8 +14,10 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -38,7 +40,7 @@ type message struct {
 }
 type session struct {
 	ID, ContactName, PickupTime, DriverToken, PassengerToken, Status string
-	DriverUID, PassengerPhone                                        string
+	DriverUID, PassengerPhone, EndReason                             string
 	Expires                                                          time.Time
 	Pickup, DriverLocation, PassengerLocation                        *point
 	Sharing                                                          bool
@@ -46,6 +48,8 @@ type session struct {
 	Revision                                                         int
 	Messages                                                         []message
 	NotifiedRevision                                                 int
+	WalkingSeconds                                                   *int
+	WalkingRevision, DepartureNotifiedRevision, WalkingGeneration    int
 }
 type store struct {
 	mu       sync.Mutex
@@ -100,6 +104,7 @@ func (p *session) expire() {
 		p.Sharing = false
 		p.ETA = nil
 		p.Messages = []message{}
+		p.WalkingSeconds = nil
 	}
 }
 func (p *session) view(role string) map[string]any {
@@ -130,7 +135,7 @@ func (p *session) view(role string) map[string]any {
 		copy := *eta
 		eta = &copy
 	}
-	return map[string]any{"id": p.ID, "contactName": p.ContactName, "pickupTime": p.PickupTime, "status": p.Status, "pickup": pickup, "driverLocation": driver, "passengerLocation": passenger, "passengerLocationSharing": visible && p.Sharing, "etaSeconds": eta, "messages": messages, "expiresAt": p.Expires.UTC().Format(time.RFC3339)}
+	return map[string]any{"id": p.ID, "contactName": p.ContactName, "pickupTime": p.PickupTime, "status": p.Status, "endReason": p.EndReason, "pickup": pickup, "driverLocation": driver, "passengerLocation": passenger, "passengerLocationSharing": visible && p.Sharing, "etaSeconds": eta, "messages": messages, "expiresAt": p.Expires.UTC().Format(time.RFC3339)}
 }
 func respond(w http.ResponseWriter, code int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -282,6 +287,8 @@ func (s *store) serveLegacy(w http.ResponseWriter, r *http.Request, internal boo
 		}
 		p.Revision++
 		p.Pickup = &point{Lat: lat, Lon: lon, Label: label, Revision: p.Revision, UpdatedAt: time.Now().UTC()}
+		p.WalkingSeconds = nil
+		p.WalkingRevision = 0
 		p.Status = "pickup_pending"
 		p.ETA = nil
 	case "confirm":
@@ -361,6 +368,7 @@ func (s *store) serveLegacy(w http.ResponseWriter, r *http.Request, internal boo
 			return
 		}
 		p.Status = "finished"
+		p.EndReason = "declined"
 		p.Pickup = nil
 		p.DriverLocation = nil
 		p.PassengerLocation = nil
@@ -373,6 +381,7 @@ func (s *store) serveLegacy(w http.ResponseWriter, r *http.Request, internal boo
 			return
 		}
 		p.Status = "finished"
+		p.EndReason = "completed"
 		p.Pickup = nil
 		p.DriverLocation = nil
 		p.PassengerLocation = nil
@@ -407,6 +416,10 @@ func main() {
 	if !strings.HasPrefix(addr, "127.0.0.1:") {
 		log.Fatal("this development server only supports a loopback bind")
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	workerDone := make(chan struct{})
+	workerStarted := false
 	store := newStore(demo)
 	if key := os.Getenv("TMAP_APP_KEY"); key != "" {
 		store.walker = newTMAPWalker(key)
@@ -432,8 +445,29 @@ func main() {
 			log.Fatalf("Storage initialization failed: %v", err)
 		}
 		defer store.db.Close()
+		if store.push != nil {
+			workerStarted = true
+			go func() { defer close(workerDone); store.runPushWorker(ctx) }()
+		}
 	}
 	server := &http.Server{Addr: addr, Handler: store, ReadHeaderTimeout: 5 * time.Second}
-	fmt.Printf("Local prototype listening on %s (demo=%t)\n", addr, demo)
-	log.Fatal(server.ListenAndServe())
+	fmt.Printf("Pickup server listening on %s (demo=%t)\n", addr, demo)
+	serveErrors := make(chan error, 1)
+	go func() { serveErrors <- server.ListenAndServe() }()
+	select {
+	case err := <-serveErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("server stopped: %v", err)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("server shutdown failed: %v", err)
+		}
+		cancel()
+	}
+	stop()
+	if workerStarted {
+		<-workerDone
+	}
 }

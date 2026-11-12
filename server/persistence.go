@@ -82,7 +82,10 @@ func (s *store) openStorage(path string) error {
 }
 
 // Caller holds s.mu. Replace only authenticated sessions; demo sessions are ephemeral.
-func (s *store) persistLocked() error {
+func (s *store) persistLocked() error { return s.persistLockedWithOutbox(nil) }
+
+// Called with s.mu held. Pickup state and critical notification jobs share one transaction.
+func (s *store) persistLockedWithOutbox(jobs []outboxItem) error {
 	if s.db == nil {
 		return nil
 	}
@@ -126,6 +129,21 @@ func (s *store) persistLocked() error {
 			}
 			if err = devices.Put([]byte(id), data); err != nil {
 				return err
+			}
+		}
+		if len(jobs) > 0 {
+			outbox, err := tx.CreateBucketIfNotExists(outboxBucket)
+			if err != nil {
+				return err
+			}
+			for _, job := range jobs {
+				data, err := json.Marshal(job)
+				if err != nil {
+					return err
+				}
+				if err := outbox.Put([]byte(job.ID), data); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

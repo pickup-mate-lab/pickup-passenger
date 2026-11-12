@@ -112,3 +112,22 @@ func TestRejectUnauthorizedAndInvalidCoordinates(t *testing.T) {
 		t.Fatal(code)
 	}
 }
+
+func TestDeclineAndCompletionAreDistinguishable(t *testing.T) {
+	s := newStore(true)
+	_, a := call(t, s, "POST", "/api/sessions", "", map[string]any{"contactName": "A"})
+	base := "/api/sessions/" + a["id"].(string)
+	code, declined := call(t, s, "POST", base+"/decline", a["passengerToken"].(string), map[string]any{})
+	if code != 200 || declined["endReason"] != "declined" {
+		t.Fatalf("decline: %d %#v", code, declined)
+	}
+	_, view := call(t, s, "GET", base, a["driverToken"].(string), nil)
+	if view["endReason"] != "declined" {
+		t.Fatalf("driver view: %#v", view)
+	}
+	_, b := call(t, s, "POST", "/api/sessions", "", map[string]any{"contactName": "B"})
+	code, completed := call(t, s, "POST", "/api/sessions/"+b["id"].(string)+"/finish", b["driverToken"].(string), map[string]any{})
+	if code != 200 || completed["endReason"] != "completed" {
+		t.Fatalf("finish: %d %#v", code, completed)
+	}
+}

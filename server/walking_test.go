@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type walkerFunc func(context.Context, float64, float64, float64, float64) (int, error)
@@ -54,5 +55,48 @@ func TestWalkingRequiresPassengerAndFreshETA(t *testing.T) {
 	code, body = call(t, s, "POST", base+"/walking-estimate", "p", map[string]any{"lat": 37.49, "lon": 127.01})
 	if code != 200 || body["departureInSeconds"] != float64(300) {
 		t.Fatal(body)
+	}
+}
+
+func TestWalkingDepartureNotification(t *testing.T) {
+	s := newStore(false)
+	s.verifier = fakeVerifier{"d": {UID: "d", Phone: "+821011111111"}, "p": {UID: "p", Phone: "+821022222222"}}
+	s.walker = walkerFunc(func(context.Context, float64, float64, float64, float64) (int, error) { return 180, nil })
+	push := fakePush{sent: make(chan string, 10)}
+	s.push = push
+	_, _ = call(t, s, "POST", "/api/v1/device", "p", map[string]any{"token": "device-token"})
+	_, created := call(t, s, "POST", "/api/v1/pickups", "d", map[string]any{"contactName": "P", "passengerPhone": "+821022222222"})
+	<-push.sent
+	base := "/api/v1/pickups/" + created["id"].(string)
+	_, _ = call(t, s, "POST", base+"/pickup", "p", map[string]any{"lat": 37.5, "lon": 127.0, "label": "exit"})
+	_, _ = call(t, s, "POST", base+"/confirm", "d", map[string]any{"revision": 1})
+	code, _ := call(t, s, "POST", base+"/walking-estimate", "p", map[string]any{"lat": 37.49, "lon": 127.01})
+	if code != 200 {
+		t.Fatal(code)
+	}
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 310})
+	select {
+	case m := <-push.sent:
+		t.Fatalf("too early: %s", m)
+	case <-time.After(30 * time.Millisecond):
+	}
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 300})
+	got := []string{}
+	for i := 0; i < 2; i++ {
+		select {
+		case m := <-push.sent:
+			got = append(got, m)
+		case <-time.After(time.Second):
+			t.Fatal("missing notification")
+		}
+	}
+	if !strings.Contains(strings.Join(got, "|"), "출발할 시간") {
+		t.Fatal(got)
+	}
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 250})
+	select {
+	case m := <-push.sent:
+		t.Fatalf("duplicate: %s", m)
+	case <-time.After(30 * time.Millisecond):
 	}
 }

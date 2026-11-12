@@ -1,0 +1,39 @@
+services:
+  api:
+    build:
+      context: ../server
+    restart: unless-stopped
+    environment:
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?Set FIREBASE_PROJECT_ID in .env}
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-admin.json
+      TMAP_APP_KEY: ${TMAP_APP_KEY:-}
+      PICKUP_DATA_FILE: /data/pickup.db
+      LISTEN_ADDR: 127.0.0.1:8787
+    volumes:
+      - pickup-data:/data
+      - ${FIREBASE_CREDENTIALS_PATH:?Set FIREBASE_CREDENTIALS_PATH in .env}:/run/secrets/firebase-admin.json:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:8787/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    network_mode: service:api
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      PICKUP_DOMAIN: ${PICKUP_DOMAIN:?Set PICKUP_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+volumes:
+  pickup-data:
+  caddy-data:
+  caddy-config:
