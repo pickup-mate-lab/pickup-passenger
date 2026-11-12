@@ -282,29 +282,28 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 			fail(w, 409, "Pickup location changed; try again")
 			return
 		}
-		// Store only the duration, not the passenger's walking origin.
+		// Do not store the passenger's walking origin.
 		oldWalk, oldRevision := p.WalkingSeconds, p.WalkingRevision
 		oldGeneration, oldNotification := p.WalkingGeneration, p.DepartureNotifiedRevision
+		oldAlertStage := p.AlertStage
 		p.WalkingSeconds, p.WalkingRevision = &seconds, revision
 		p.WalkingGeneration++
 		p.DepartureNotifiedRevision = 0
+		if p.AlertStage == stageDeparture {
+			p.AlertStage = stageNone
+		}
 		if err := s.persistLocked(); err != nil {
 			p.WalkingSeconds, p.WalkingRevision = oldWalk, oldRevision
 			p.WalkingGeneration, p.DepartureNotifiedRevision = oldGeneration, oldNotification
+			p.AlertStage = oldAlertStage
 			s.mu.Unlock()
 			fail(w, 500, "Unable to save walking estimate")
 			return
 		}
-		var depart *int
-		if p.ETA != nil && p.DriverLocation != nil && time.Since(p.DriverLocation.UpdatedAt) < 60*time.Second {
-			v := *p.ETA - seconds - 120
-			if v < 0 {
-				v = 0
-			}
-			depart = &v
-		}
+		depart := p.departureIn()
 		s.mu.Unlock()
 		respond(w, 200, map[string]any{"walkingSeconds": seconds, "departureInSeconds": depart, "pickupRevision": revision, "provider": "TMAP"})
+		s.checkAlerts(parts[3])
 		return
 	}
 	// The legacy engine enforces driver/passenger permissions and never receives
@@ -324,46 +323,7 @@ func (s *store) serveAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if parts[4] == "location" && isDriver {
-		s.mu.Lock()
-		p = s.sessions[parts[3]]
-		var jobs []outboxItem
-		var arrival, departure bool
-		var phone string
-		var revision, oldArrival, oldDeparture int
-		if p != nil && p.Status == "active" && p.Pickup != nil && p.ETA != nil {
-			phone, revision = p.PassengerPhone, p.Revision
-			oldArrival, oldDeparture = p.NotifiedRevision, p.DepartureNotifiedRevision
-			match := func(d deviceRecord) bool { return d.Phone == phone }
-			if *p.ETA <= 300 && p.NotifiedRevision != revision {
-				next := s.makePushJobsLocked(match, arrivalPush, p.ID, revision)
-				if len(next) > 0 {
-					arrival = true
-					p.NotifiedRevision = revision
-					jobs = append(jobs, next...)
-				}
-			}
-			if p.WalkingSeconds != nil && p.WalkingRevision == revision && p.DepartureNotifiedRevision != revision && *p.ETA <= *p.WalkingSeconds+120 {
-				next := s.makePushJobsLocked(match, departurePush, p.ID, revision)
-				if len(next) > 0 {
-					departure = true
-					p.DepartureNotifiedRevision = revision
-					jobs = append(jobs, next...)
-				}
-			}
-			if (arrival || departure) && s.persistLockedWithOutbox(jobs) != nil {
-				p.NotifiedRevision, p.DepartureNotifiedRevision = oldArrival, oldDeparture
-				arrival, departure = false, false
-			}
-		}
-		durable := s.db != nil
-		s.mu.Unlock()
-		// In-memory demo/test stores have no worker or persistent queue.
-		if !durable && arrival {
-			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, arrivalPush, parts[3], revision)
-		}
-		if !durable && departure {
-			s.notify(func(d deviceRecord) bool { return d.Phone == phone }, departurePush, parts[3], revision)
-		}
+		s.checkAlerts(parts[3])
 	}
 }
 

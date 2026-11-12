@@ -134,7 +134,11 @@ func (s *store) processPushOutbox(ctx context.Context, now time.Time) {
 		}
 		waitForFreshETA := false
 		if valid && job.Revision > 0 {
-			waitForFreshETA = pickup.ETA == nil || pickup.DriverLocation == nil || time.Since(pickup.DriverLocation.UpdatedAt) > time.Minute
+			if job.Body == alertText[stageArrived] {
+				waitForFreshETA = !pickup.driverFresh() || pickup.Pickup == nil || distanceMeters(pickup.DriverLocation.Lat, pickup.DriverLocation.Lon, pickup.Pickup.Lat, pickup.Pickup.Lon) > arrivedMeters
+			} else {
+				waitForFreshETA = pickup.ETA == nil || pickup.DriverLocation == nil || time.Since(pickup.DriverLocation.UpdatedAt) > time.Minute
+			}
 			if !waitForFreshETA && job.Body == arrivalPush {
 				waitForFreshETA = *pickup.ETA > 300
 			}

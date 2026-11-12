@@ -61,7 +61,7 @@ func TestWalkingRequiresPassengerAndFreshETA(t *testing.T) {
 func TestWalkingDepartureNotification(t *testing.T) {
 	s := newStore(false)
 	s.verifier = fakeVerifier{"d": {UID: "d", Phone: "+821011111111"}, "p": {UID: "p", Phone: "+821022222222"}}
-	s.walker = walkerFunc(func(context.Context, float64, float64, float64, float64) (int, error) { return 180, nil })
+	s.walker = walkerFunc(func(context.Context, float64, float64, float64, float64) (int, error) { return 300, nil })
 	push := fakePush{sent: make(chan string, 10)}
 	s.push = push
 	_, _ = call(t, s, "POST", "/api/v1/device", "p", map[string]any{"token": "device-token"})
@@ -74,15 +74,15 @@ func TestWalkingDepartureNotification(t *testing.T) {
 	if code != 200 {
 		t.Fatal(code)
 	}
-	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 310})
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 430})
 	select {
 	case m := <-push.sent:
 		t.Fatalf("too early: %s", m)
 	case <-time.After(30 * time.Millisecond):
 	}
-	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 300})
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 420})
 	got := []string{}
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 1; i++ {
 		select {
 		case m := <-push.sent:
 			got = append(got, m)
@@ -93,7 +93,7 @@ func TestWalkingDepartureNotification(t *testing.T) {
 	if !strings.Contains(strings.Join(got, "|"), "출발할 시간") {
 		t.Fatal(got)
 	}
-	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 250})
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 400})
 	select {
 	case m := <-push.sent:
 		t.Fatalf("duplicate: %s", m)

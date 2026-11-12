@@ -125,7 +125,7 @@ func TestArrivalQueuePersistsTogetherWithPickup(t *testing.T) {
 	base := "/api/v1/pickups/" + id
 	_, _ = call(t, s, "POST", base+"/pickup", "p", map[string]any{"lat": 37.5, "lon": 127.0, "label": "exit"})
 	_, _ = call(t, s, "POST", base+"/confirm", "d", map[string]any{"revision": 1})
-	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 240})
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 240})
 	if err := s.db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestArrivalQueuePersistsTogetherWithPickup(t *testing.T) {
 			t.Fatal("sent arrival with stale ETA")
 		}
 	}
-	_, _ = call(t, next, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 240})
+	_, _ = call(t, next, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 240})
 	next.processPushOutbox(context.Background(), time.Now())
 	found := false
 	for len(sent) > 0 {
@@ -221,9 +221,9 @@ func TestWaitingPlaceChangeInvalidatesOldDeparture(t *testing.T) {
 	s.push = fakePush{sent: sent}
 	s.walker = walkerFunc(func(_ context.Context, lat, lon, _, _ float64) (int, error) {
 		if lat == 37.49 {
-			return 180, nil
+			return 300, nil
 		}
-		return 60, nil
+		return 240, nil
 	})
 	_, _ = call(t, s, "POST", "/api/v1/device", "p", map[string]any{"token": "device-token"})
 	_, created := call(t, s, "POST", "/api/v1/pickups", "d", map[string]any{"contactName": "P", "passengerPhone": "+821022222222"})
@@ -234,7 +234,7 @@ func TestWaitingPlaceChangeInvalidatesOldDeparture(t *testing.T) {
 	if code != 200 {
 		t.Fatal(code)
 	}
-	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 290})
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 400})
 	code, _ = call(t, s, "POST", base+"/walking-estimate", "p", map[string]any{"lat": 37.48, "lon": 127.02})
 	if code != 200 {
 		t.Fatal(code)
@@ -245,7 +245,7 @@ func TestWaitingPlaceChangeInvalidatesOldDeparture(t *testing.T) {
 			t.Fatal("sent obsolete departure notification")
 		}
 	}
-	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.5, "lon": 127.0, "etaSeconds": 180})
+	_, _ = call(t, s, "POST", base+"/location", "d", map[string]any{"lat": 37.51, "lon": 127.0, "etaSeconds": 360})
 	s.processPushOutbox(context.Background(), time.Now())
 	found := false
 	for len(sent) > 0 {

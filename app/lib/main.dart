@@ -4,6 +4,7 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -14,6 +15,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+import 'arrival.dart';
 import 'phone_auth.dart';
 
 Future<void> main() async {
@@ -197,6 +199,9 @@ class _PassengerHomeState extends State<PassengerHome>
   bool editingPickup = false;
   bool busy = false;
   bool sharing = false;
+  bool resumeSharing = false;
+  int alertedStage = 0;
+  Object? alertedRevision;
   bool foreground = true;
   bool locationBusy = false;
   bool inboxBusy = false;
@@ -433,14 +438,10 @@ class _PassengerHomeState extends State<PassengerHome>
       }
       if (mounted) {
         setState(() {
-          final currentPickup = current['pickup'] as Map<String, dynamic>?;
-          if (walking != null &&
-              currentPickup?['revision'] != walking!['pickupRevision']) {
-            walking = null;
-          }
           state = current;
           error = null;
         });
+        announceStage(current);
       }
       if (sharing &&
           !locationBusy &&
@@ -658,8 +659,22 @@ class _PassengerHomeState extends State<PassengerHome>
       });
       waitingLocation = chosen;
       walking = result;
+      state = await api.state();
+      if (mounted && state != null) announceStage(state!);
       if (mounted) setState(() {});
     });
+  }
+
+  void announceStage(Map<String, dynamic> current) {
+    final revision = (current['pickup'] as Map<String, dynamic>?)?['revision'];
+    if (revision != alertedRevision) { alertedRevision = revision; alertedStage = 0; }
+    final stage = current['arrivalStage'] as String?;
+    final rank = stageRank(stage);
+    final text = stageAlert(stage);
+    if (rank <= alertedStage || text == null || !mounted) return;
+    alertedStage = rank;
+    HapticFeedback.mediumImpact();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
   }
 
   Future<void> setSharing(bool enabled) async {
@@ -881,10 +896,9 @@ class _PassengerHomeState extends State<PassengerHome>
     final pickup = state?['pickup'] as Map<String, dynamic>?;
     final driver = state?['driverLocation'] as Map<String, dynamic>?;
     final eta = state?['etaSeconds'] as int?;
-    final walkSeconds = walking?['walkingSeconds'] as int?;
-    final departure = eta != null && walkSeconds != null
-        ? eta - walkSeconds - 120
-        : null;
+    final walkSeconds = (state?['walkingSeconds'] ?? walking?['walkingSeconds']) as int?;
+    final departure = state?['departureInSeconds'] as int? ??
+        (eta != null && walkSeconds != null ? eta - walkSeconds - 120 : null);
     final messages = (state?['messages'] as List<dynamic>?) ?? [];
     final closed = status == 'finished' || status == 'expired';
     if (state != null && !closed) {
